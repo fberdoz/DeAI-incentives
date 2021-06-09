@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-from tqdm import tqdm
 from sklearn.preprocessing import LabelEncoder
 from matplotlib import pyplot as plt
 from random import sample
@@ -13,7 +12,7 @@ from itertools import chain, combinations
 from math import factorial
 
 #########################################################
-#                  Federated Learning                   #
+#                  Learning Algorithm                   #
 #########################################################
 
 def client_update(client_model, optimizer, criterion, train_loader, epoch=5):
@@ -29,25 +28,31 @@ def client_update(client_model, optimizer, criterion, train_loader, epoch=5):
     return loss.item()
 
 
-def diffuse_params(client_models, communication_matrix):
-    """Diffuse the models with their neighbors. Found in the DeAI repository."""
-    if client_models:
-        client_state_dicts = [model.state_dict() for model in client_models]
-        keys = client_state_dicts[0].keys()
-    for model, weights in zip(client_models, communication_matrix):
-        neighbors = np.nonzero(weights)[0]
-        model.load_state_dict(
-            {
-                key: torch.stack(
-                    [weights[j]*client_state_dicts[j][key] for j in neighbors],
-                    dim=0,
-                ).sum(0) / weights.sum() 
-                for key in keys
-            }
-        )
+
+def diffuse_params(client_models, coal_models, communication_matrix):
+    """
+    Diffuse the models with their neighbors. Found in the DeAI repository.
+    """
+
+    client_state_dicts = [model.state_dict() for model in client_models]
+    keys = client_state_dicts[0].keys()
+        
+    for i, (model, weights) in enumerate(zip(client_models, communication_matrix.transpose())):     
+        for coal in powerset(np.nonzero(weights)[0]):
+            if coal != ():
+                coal_weights = np.zeros(weights.shape)
+                coal_weights[list(coal)] = weights[list(coal)] / np.sum(weights[list(coal)])
+                coal_models[i, coal].load_state_dict(
+                    {
+                        key: torch.stack(
+                            [coal_weights[j]*client_state_dicts[j][key] for j in coal],
+                            dim=0,
+                        ).sum(0)
+                        for key in keys
+                    })
 
 def average_models(global_model, client_models):
-    """Average models across all clients. Found in the DeAI repository."""
+    """Average models across all clients from client_models . Found in the DeAI repository."""
     global_dict = global_model.state_dict()
     for k in global_dict.keys():
         global_dict[k] = torch.stack([client_models[i].state_dict()[k] for i in range(len(client_models))], 0).mean(0)
@@ -58,7 +63,10 @@ def average_models(global_model, client_models):
 #########################################################
 
 def evaluate_model(model, data_loader, criterion=None, threshold=0.5):
-    """Compute loss and accuracy of a single model on a data_loader."""
+    """
+    Compute loss and different performance metric of a single model using a data_loader.
+    Returns a dictionary.
+    """
     model.eval()
     n = len(data_loader.dataset)
     if n == 0:
@@ -134,17 +142,9 @@ def evaluate_model(model, data_loader, criterion=None, threshold=0.5):
         'FPR': FPR
     }
     return perf
-
-def evaluate_many_models(models, data_loader, criterion, threshold):
-    """Compute average loss and accuracy of multiple models on a data_loader."""
-    num_nodes = len(models)
-    performances = []
-    for i in range(num_nodes):
-        perfs += [evaluate_model(models[i], data_loader, criterion, threshold)]
-    return performances
-
+    
 def initialize_perf(sizes):
-    'Initialize the performance dictionary, for code clarity.'
+    'Initialize a performance dictionary of a given size.'
     perf = {
         'loss_norm': np.zeros(sizes),
         'accuracy': np.zeros(sizes),
@@ -155,10 +155,13 @@ def initialize_perf(sizes):
     }
     return perf
 
+
 def fill_perf_history(perf, perf_hist, index):
-    'Fill an history dictionary with another dictionary with the same keys.'
+    'Fill an history dictionary with another dictionary that has the same keys, but ony one value per key.'
     for key in perf:
         perf_hist[key][index] = perf[key]
+        
+
         
 #########################################################
 #                     Data Loading                      #
@@ -202,7 +205,7 @@ class TabularDataset(torch.utils.data.Dataset):
               return [self.cont_X[index], self.cat_X[index]]
             
             
-def load_into_df(dataset, drop=[], na="mean_feature"):
+def load_into_df(dataset, drop=[]):
     """Load the given dataset into panda dataframes, and returns some useful metadata."""
     
     if dataset == 'titanic':
@@ -226,18 +229,8 @@ def load_into_df(dataset, drop=[], na="mean_feature"):
             else:
                 all_df[cat_col] = LabelEncoder().fit_transform(all_df[cat_col])
 
-        # Filling the empty cells using the specified mode.
-        if na == 'mean_feature':
-            all_df = all_df.fillna(all_df.mean()) 
-
-        elif na == 'discard_sample':
-            raise NotImplementedError
-
-        elif na == 'discard_feature':
-            raise NotImplementedError
-
-        else:
-            raise ValueError('Unkown argument: {}.'.format(na))
+        # Filling the empty cells using the mean value (default preprocessing).
+        all_df = all_df.fillna(all_df.mean()) 
 
         # Metadata for centralizing information
         cat_dims = [int(all_df[col].nunique()) for col in cat_cols] # Numbers of categories for each caterorical features
@@ -284,18 +277,10 @@ def load_into_df(dataset, drop=[], na="mean_feature"):
         for cat_col in cat_cols:
             all_df[cat_col] = LabelEncoder().fit_transform(all_df[cat_col])
 
-        # Filling the empty cells using the specified mode.
-        if na == 'mean_feature':
-            all_df = all_df.fillna(all_df.mean()) 
+        # Filling the empty cells using the mean value (default preprocessing).
 
-        elif na == 'discard_sample':
-            raise NotImplementedError
+        all_df = all_df.fillna(all_df.mean()) 
 
-        elif na == 'discard_feature':
-            raise NotImplementedError
-
-        else:
-            raise ValueError('Unkown argument: {}.'.format(na))
 
         # Metadata for centralizing information
         cat_dims = [int(all_df[col].nunique()) for col in cat_cols] # Numbers of categories for each caterorical features
@@ -314,63 +299,12 @@ def load_into_df(dataset, drop=[], na="mean_feature"):
         }
 
         return all_df, meta
+    
     else:
         raise ValueError('Unkown dataset')
 
-def df_to_datasets(data_df, num_clients, meta, f_test=0.2, f_tot=1):
-    """Split the full dataframe into several datasets (one per clients)."""
-    
-    # Full dataset
-    full_ds = TabularDataset(data_df, meta['cat_cols'], meta['label'])
-    N_full = len(full_ds)
-    
-    # Reduced dataset (for code verification)
-    reduced_ds = torch.utils.data.random_split(full_ds, [int(f_tot * len(data_df)), len(data_df) - int(f_tot * len(data_df))])[0]
-    N_red = len(reduced_ds)
-    
-    # Creating the size list for each dataset
-    if isinstance(num_clients, int) and num_clients > 0:
-        sizes = [int(1/num_clients * N_red) for _ in range(num_clients)]
-    
-    elif isinstance(num_clients, list) and len(num_clients) > 0 and sum(num_clients) <= 1.0 and all(sz > 0 for sz in num_clients):
-        sizes = [int(f * N_red) for f in num_clients]
 
-    else:
-        raise ValueError("""Argument 'num_clients' is of wrong type or value.\nMust be a positive
-                            integer or a nonempty list of positive float summing to at most 1.\n
-                            Currently of type {}.""".format(type(num_clients)))
-               
-    # Splitting the datatests
-    if (N_red - sum(sizes)) != 0:
-        split_ds = torch.utils.data.random_split(reduced_ds, sizes + [N_red - sum(sizes)])
-        res = split_ds.pop()
-    else:
-        split_ds = torch.utils.data.random_split(reduced_ds, sizes)
-    
-    # Splitting each datasets into a training and testing dataset
-
-    train_ds = []
-    test_ds = []
-    
-    N_tr = 0
-    N_te = 0
-    
-    for ds in split_ds:
-        N_te_i = int(f_test * len(ds))
-        N_tr_i = len(ds) - N_te_i
-        
-        train_ds_i, test_ds_i = torch.utils.data.random_split(ds, [N_tr_i, N_te_i])
-        train_ds.append(train_ds_i)
-        test_ds.append(test_ds_i)
-        
-        N_tr += N_tr_i
-        N_te += N_te_i
-        
-    print("Sizes:\nFull dataset: {}\nReduced dataset: {}\nSplitted datasets (total): {} (train: {}, test: {})\nPer client: {}"
-          .format(N_full, N_red, sum(sizes), N_tr, N_te, sizes))
-    return  train_ds, test_ds
-
-def df_to_ds(data_df, sizes, meta, f_test=0.2, x_noise=None, x_acc=None, y_acc=None):
+def df_to_ds(data_df, sizes, meta, f_test=0.2, y_acc=None, x_noise=None):
     """Split the full dataframe into several datasets (one per clients)."""
     
     # Full dataset
@@ -395,26 +329,23 @@ def df_to_ds(data_df, sizes, meta, f_test=0.2, x_noise=None, x_acc=None, y_acc=N
         res = split_ds.pop()
     else:
         split_ds = torch.utils.data.random_split(full_ds, sizes)
-    
-    # Altering features
-    # Continuous features
-    if x_noise is not None:
-        assert isinstance(x_noise, list) and len(x_noise) == len(sizes)
-        raise NotImplemetedError
-        
-    # Categorical features   
-    if x_acc is not None:
-        assert isinstance(x_acc, list) and len(x_acc) == len(sizes)
-        raise NotImplemetedError
-    
-    # Altering labels
+
+    # Altering labels by switching a fraction of them
     if y_acc is not None:
         assert isinstance(y_acc, list) and len(y_acc) == len(sizes)
         for i, ds in enumerate(split_ds):
             n2change = int((1.0 - y_acc[i]) * len(ds))
             idx2change = sample(ds.indices, n2change)
             full_ds.label[idx2change] = 1.0 - full_ds.label[idx2change]
-        
+
+    # Altering continuous features with noise
+    if x_noise is not None:
+        assert isinstance(x_noise, list) and len(x_noise) == len(sizes)
+        for i, ds in enumerate(split_ds):
+            noise = np.random.normal(scale=x_noise[i], size=(len(ds.indices), meta['n_cont']))
+            full_ds.cont_X[ds.indices] = (full_ds.cont_X[ds.indices] + noise) / np.sqrt(np.var(full_ds.cont_X[ds.indices],axis=0) + x_noise[i]**2)
+
+            
     # Splitting each datasets into a training and testing dataset
     train_ds = []
     test_ds = []
@@ -435,15 +366,16 @@ def df_to_ds(data_df, sizes, meta, f_test=0.2, x_noise=None, x_acc=None, y_acc=N
         
     print("Sizes:\nFull dataset: {}\nSplitted datasets (total): {} (train: {}, test: {})\nPer client: {}"
           .format(N_full, sum(sizes), N_tr, N_te, sizes))
+    
     return  train_ds, test_ds
 
 
-def ds_to_dataloaders(dataset, batch_size):
+def ds_to_dataloaders(dataset, batch_size, shuffle=True):
     """Create a (list of) torch dataloader(s) given a (list of) dataset(s)"""
     if isinstance(dataset, list):
-        dl = [torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True) for ds in dataset]
+        dl = [torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle) for ds in dataset]
     elif isinstance(dataset, torch.utils.data.dataset.Subset) or isinstance(dataset, torch.utils.data.dataset.ConcatDataset):
-        dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     else:
         raise TypeError("Argument 'dataset' is of type {}. Must be a torch dataset or a list of torch datasets.".format(type(dataset)))
     
@@ -463,40 +395,119 @@ def normalize(df, meta):
 #                    Contributions                      #
 #########################################################
 
-def marginal_contribution(perf, marg_perfs, profit=False):
-    if profit:
-        contributions = perf - marg_perfs
-    else:
-        contributions = marg_perfs - perf
-    return contributions
-
 def powerset(iterable):
     "powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)"
     s = list(iterable)
     return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
 
 
-def ShapleyValues(n, coal_models, marg_loaders, metric, criterion, threshold, profit=False):
-
+def SV_FL(n, coal_models, test_loader, metric, criterion, threshold):
+    """Computes the different shapley values from the point of vue of the central server.
+    
+        Inputs 
+        - n            : Total numer of users
+        - coal_models  : Models of the different (sub)coalitions
+        - marg_loaders : Marginal test datasets of all the users
+        - metric       : Metric used for the Shapley values
+        - criterion    : Loss function
+        - threshold    : Threshold for classification
+        
+        Output:
+        - sv           : Shapley values of all the users from the point of the central server
+    """
     sv = np.zeros(n)
     
-    for client_id in range(n):
+    for user in range(n):
         for coal in powerset(range(n)):
-            if client_id in coal:
+            if user in coal:
                 
-                
-                coal_minus_client = list(coal)
-                coal_minus_client.remove(client_id)
-                coal_minus_client = tuple(coal_minus_client)
+                coal_minus_user = list(coal)
+                coal_minus_user.remove(user)
+                coal_minus_user = tuple(coal_minus_user)
                 
                 coeff = factorial(n-len(coal)) * factorial(len(coal)-1) / factorial(n)
                 
-                perf_with_client = evaluate_model(coal_models[coal], marg_loaders[client_id], criterion, threshold)[metric]
-                perf_minus_client = evaluate_model(coal_models[coal_minus_client], marg_loaders[client_id], criterion, threshold)[metric]
-                
-                if profit:
-                    sv[client_id] += coeff * (perf_with_client - perf_minus_client)
+                if isinstance(test_loader, list):
+                    perf_with_user = evaluate_model(coal_models[coal], test_loader[user], criterion, threshold)[metric]
+                    perf_minus_user = evaluate_model(coal_models[coal_minus_user], test_loader[user], criterion, threshold)[metric]
                 else:
-                    sv[client_id] += coeff * (perf_minus_client - perf_with_client)
-                        
+                    perf_with_user = evaluate_model(coal_models[coal], test_loader, criterion, threshold)[metric]
+                    perf_minus_user = evaluate_model(coal_models[coal_minus_user], test_loader, criterion, threshold)[metric]
+                
+                if metric == 'loss_norm':
+                    sv[user] += coeff * (perf_minus_user - perf_with_user)                    
+                else:
+                    sv[user] += coeff * (perf_with_user - perf_minus_user)    
     return sv
+
+def SV_P2PL(n, client, global_coal, coal_models, test_loader, metric, criterion, threshold):
+    """Computes the different shapley values from the point of vue of user 'client'.
+    
+        Inputs 
+        - n           : Total numer of users
+        - client      : Index of the client that computes the Shapley values
+        - global_coal : Tuple of all the users that sends their model to 'client'
+        - coal_models : Models of the different (sub)coalitions of global_coal
+        - test_loader : Test dataset of 'client'
+        - metric      : Metric used for the Shapley values
+        - criterion   : Loss function
+        - threshold   : Threshold for classification
+        
+        Output:
+        - sv          : Shapley values of all the users from the point of vue of 'client'
+    """
+    sv = np.zeros(n)
+    
+    for user in global_coal:
+        for coal in powerset(global_coal):
+            if user in coal:
+                
+                coal_minus_user = list(coal)
+                coal_minus_user.remove(user)
+                coal_minus_user = tuple(coal_minus_user)
+                
+                coeff = factorial(n-len(coal)) * factorial(len(coal)-1) / factorial(n)
+                
+                perf_with_user = evaluate_model(coal_models[client, coal], test_loader, criterion, threshold)[metric]
+                perf_minus_user = evaluate_model(coal_models[client, coal_minus_user], test_loader, criterion, threshold)[metric]
+                
+                if metric == 'loss_norm':
+                    sv[user] += coeff * (perf_minus_user - perf_with_user)                    
+                else:
+                    sv[user] += coeff * (perf_with_user - perf_minus_user)    
+    return sv
+
+#########################################################
+#                    Normalisation                      #
+#########################################################
+
+def L2(CM, axis=1):
+    "L2 normalisation."
+    CM_norm = CM / np.sqrt(np.sum(np.square(CM), axis=axis, keepdims=True))
+    return CM_norm
+
+def maxnorm(CM, axis=1):
+    "Max-norm normalisation."
+    CM_norm = CM / np.abs(CM.max(axis=axis, keepdims=True))
+    return CM_norm
+
+def minmax(CM, axis=1):
+    "Min-Max normalisation."
+    CM_norm = (CM - CM.min(axis=axis, keepdims=True)) / (CM.max(axis=axis, keepdims=True) - CM.min(axis=axis, keepdims=True))
+    return CM_norm
+
+def maxmax(CM, alpha=1, axis=1):
+    "Max-Max normlisation (i.e. Min-Max where Min is replaced by -alpha * Max)."
+    CM_norm = (CM + alpha * CM.max(axis=axis, keepdims=True)) / ((1 + alpha) * CM.max(axis=axis, keepdims=True))
+    return CM_norm
+
+def softmax(CM, theta=1, axis=1):
+    "Softmax normalisation (with parameter theta)."
+    CM_norm = np.exp(CM * theta)
+    CM_norm /= np.sum(CM_norm, axis=axis, keepdims=True)
+    return CM_norm
+
+def standard(CM, axis=1):
+    "Standard normalisation (substracting the mean and dividing by the standard deviation)."
+    CM_norm = (CM - np.mean(CM, axis=axis, keepdims=True)) / np.std(CM, axis=axis, keepdims=True)
+    return CM_norm
